@@ -16,6 +16,7 @@ func (v testValue) Len() int {
 }
 
 // 测试缓存基本操作
+// 测试单个cache
 func TestCacheBasic(t *testing.T) {
 	t.Run("初始化缓存", func(t *testing.T) {
 		c := Create(10)
@@ -132,6 +133,8 @@ func TestCacheBasic(t *testing.T) {
 		}
 
 		// 填满缓存
+		// 用rune写法能优化性能
+		// 如果fmt.Sprintf("key%d", i) 或者 strconv.Itoa(i)，会导致性能下降
 		for i := 1; i <= 3; i++ {
 			c.put("key"+string(rune('0'+i)), testValue("value"+string(rune('0'+i))), 100, onEvicted)
 		}
@@ -223,6 +226,8 @@ func TestCacheBasic(t *testing.T) {
 
 		// 测试提前终止遍历
 		var earlyKeys []string
+		//walk签名里有一个walker参数，返回值是bool，如果是false，就终止遍历
+		// 对应这个例子里的len(earlyKeys)<2就是提前终止
 		c.walk(func(key string, value Value, expireAt int64) bool {
 			earlyKeys = append(earlyKeys, key)
 			return len(earlyKeys) < 2 // 只收集前2个键
@@ -239,6 +244,7 @@ func TestCacheBasic(t *testing.T) {
 func TestCacheLRUEviction(t *testing.T) {
 	var evictedKeys []string
 	onEvicted := func(key string, value Value) {
+		//记录被淘汰的key
 		evictedKeys = append(evictedKeys, key)
 	}
 
@@ -249,12 +255,15 @@ func TestCacheLRUEviction(t *testing.T) {
 	c.put("key1", testValue("value1"), Now()+int64(time.Hour), onEvicted)
 	c.put("key2", testValue("value2"), Now()+int64(time.Hour), onEvicted)
 	c.put("key3", testValue("value3"), Now()+int64(time.Hour), onEvicted)
+	//HEAD → key3 → key2 → key1 → TAIL
 
+	//容量为3，不应该有淘汰，所以不该为0
 	if len(evictedKeys) != 0 {
 		t.Errorf("Expected no evictions, got %v", evictedKeys)
 	}
 
-	// 访问key1使其成为最近使用的
+	// 访问key1使其成为最近使用的，
+	// key1-key3-key2此时应该淘汰key2
 	c.get("key1")
 
 	// 添加第4个项，应该淘汰最少使用的key2
@@ -328,7 +337,7 @@ func TestCacheAdjust(t *testing.T) {
 	// 获取key1的索引
 	idx1 := c.hmap["key1"]
 
-	// 将key1移动到链表头部
+	// 将key1移动到链表头部，p=0,n=1
 	c.adjust(idx1, p, n)
 
 	// 验证key1现在是最近使用的
@@ -349,13 +358,14 @@ func TestCacheAdjust(t *testing.T) {
 func TestLRU2StoreBasicOperations(t *testing.T) {
 	var evictedKeys []string
 	onEvicted := func(key string, value Value) {
+		// 淘汰的时候，记录被淘汰的key-value
 		evictedKeys = append(evictedKeys, fmt.Sprintf("%s:%v", key, value))
 	}
 
 	opts := Options{
-		BucketCount:     4,
-		CapPerBucket:    2,
-		Level2Cap:       3,
+		BucketCount:     4, //4个桶
+		CapPerBucket:    2, //L1容量
+		Level2Cap:       3, // L2容量
 		CleanupInterval: time.Minute,
 		OnEvicted:       onEvicted,
 	}

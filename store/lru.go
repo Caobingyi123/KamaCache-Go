@@ -21,7 +21,7 @@ type lruCache struct {
 	closeCh         chan struct{}                 // 用于优雅关闭清理协程
 }
 
-// lruEntry 表示缓存中的一个条目
+// lruEntry 表示缓存中的一个条目，也就是一个节点
 type lruEntry struct {
 	key   string
 	value Value // 在store里面定义的接口，需实现Len方法，统计字节数量
@@ -324,8 +324,9 @@ func (c *lruCache) SetMaxBytes(maxBytes int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	//设置新的最大允许内存
-	c.maxBytes = maxBytes //清理超内存项目
+	c.maxBytes = maxBytes
 	if maxBytes > 0 {
+		//清理超内存项目
 		c.evict()
 	}
 }
