@@ -363,8 +363,8 @@ func TestLRU2StoreBasicOperations(t *testing.T) {
 	}
 
 	opts := Options{
-		BucketCount:     4, //4个桶
-		CapPerBucket:    2, //L1容量
+		BucketCount:     4, // 4个桶
+		CapPerBucket:    2, // L1容量
 		Level2Cap:       3, // L2容量
 		CleanupInterval: time.Minute,
 		OnEvicted:       onEvicted,
@@ -601,7 +601,7 @@ func TestLRU2Store_Get(t *testing.T) {
 	defer store.Close()
 
 	// 向一级缓存添加一个项
-	idx := hashBKRD("test-key") & store.mask
+	idx := hashBKRD("test-key") & store.mask // 先拿到桶的index
 	store.caches[idx][0].put("test-key", testValue("test-value"), Now()+int64(time.Hour), nil)
 
 	// 使用_get直接从一级缓存获取
@@ -691,6 +691,7 @@ func TestLRU2StoreDelete(t *testing.T) {
 }
 
 // 测试并发操作
+// 测试多携程的时候 set,get,delete等方法是否能正常工作
 func TestLRU2StoreConcurrent(t *testing.T) {
 	opts := Options{
 		BucketCount:     8,
@@ -755,8 +756,8 @@ func TestLRU2StoreConcurrent(t *testing.T) {
 
 	// 验证大致长度
 	// 每个协程添加了operationsPerGoroutine项，又删除了一半
-	expectedItems := goroutines * operationsPerGoroutine / 2
-	actualItems := store.Len()
+	expectedItems := goroutines * operationsPerGoroutine / 2 //理论上是500
+	actualItems := store.Len()                               // 获取实际长度
 
 	// 允许一些误差，因为可能有一些键碰撞或未完成的操作
 	tolerance := expectedItems / 10
@@ -778,7 +779,7 @@ func TestLRU2StoreHitRatio(t *testing.T) {
 	store := newLRU2Cache(opts)
 	defer store.Close()
 
-	// 添加50个项
+	// 添加50个项，会平均分到4个桶，但是容量只有10，所以会淘汰。
 	for i := 0; i < 50; i++ {
 		store.Set(fmt.Sprintf("key%d", i), testValue(fmt.Sprintf("value%d", i)))
 	}
@@ -798,15 +799,16 @@ func TestLRU2StoreHitRatio(t *testing.T) {
 	}
 
 	// 计算命中率
+	// attempts = 100     hits 大概是30左右，因为50减掉前面超出容量的那部分
 	hitRatio := float64(hits) / float64(attempts)
 
-	// 验证命中率大致为0.25-0.35（因为我们添加了50个项但有分桶和LRU淘汰）
+	// 验证命中率大致为0.25-0.35（因为我们添加了50个项但有分桶和LRU淘汰），在30%左右是合理的
 	if hitRatio < 0.25 || hitRatio > 0.35 {
 		t.Errorf("Hit ratio out of expected range: got %.2f", hitRatio)
 	}
 }
 
-// 测试缓存容量增长和性能
+// 测试缓存容量增长和性能，testing.B一般就是性能测试，.T是正确性测试
 func BenchmarkLRU2StoreOperations(b *testing.B) {
 	opts := Options{
 		BucketCount:     16,
@@ -823,7 +825,7 @@ func BenchmarkLRU2StoreOperations(b *testing.B) {
 	for i := 0; i < 5000; i++ {
 		store.Set(fmt.Sprintf("init-key%d", i), testValue(fmt.Sprintf("value%d", i)))
 	}
-
+	//重置时间，前面初始化的不算
 	b.ResetTimer()
 
 	// 混合操作基准测试
@@ -831,7 +833,7 @@ func BenchmarkLRU2StoreOperations(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			key := fmt.Sprintf("bench-key%d", i%10000)
 
-			// 75%的几率执行Get，25%的几率执行Set
+			// 75%的几率执行Get，25%的几率执行Set，真实情况读>>写。
 			if i%4 != 0 {
 				store.Get(key)
 			} else {

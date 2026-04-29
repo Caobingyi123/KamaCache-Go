@@ -1,18 +1,21 @@
 package kamacache
 
+//cache.go属于是整个系统的门面层
+
 import (
 	"context"
-	"github.com/youngyangyang04/KamaCache-Go/store"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/youngyangyang04/KamaCache-Go/store"
 
 	"github.com/sirupsen/logrus"
 )
 
 // Cache 是对底层缓存存储的封装
 type Cache struct {
-	mu          sync.RWMutex
+	mu          sync.RWMutex // 用来保护store指针的生命周期
 	store       store.Store  // 底层存储实现
 	opts        CacheOptions // 缓存配置选项
 	hits        int64        // 缓存命中次数
@@ -55,7 +58,7 @@ func NewCache(opts CacheOptions) *Cache {
 // ensureInitialized 确保缓存已初始化
 func (c *Cache) ensureInitialized() {
 	// 快速检查缓存是否已初始化，避免不必要的锁争用
-	if atomic.LoadInt32(&c.initialized) == 1 {
+	if atomic.LoadInt32(&c.initialized) == 1 { // 原子操作，线程安全
 		return
 	}
 
@@ -63,7 +66,7 @@ func (c *Cache) ensureInitialized() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.initialized == 0 {
+	if c.initialized == 0 { // 防止两个goroutine同时初始化，如果没有这个条件，可能多个goroutine同时创建多个store
 		// 创建存储选项
 		storeOpts := store.Options{
 			MaxBytes:        c.opts.MaxBytes,
@@ -106,7 +109,7 @@ func (c *Cache) Get(ctx context.Context, key string) (value ByteView, ok bool) {
 
 	// 如果缓存未初始化，直接返回未命中
 	if atomic.LoadInt32(&c.initialized) == 0 {
-		atomic.AddInt64(&c.misses, 1)
+		atomic.AddInt64(&c.misses, 1) // 更新未命中计数，原子操作
 		return ByteView{}, false
 	}
 
@@ -123,7 +126,7 @@ func (c *Cache) Get(ctx context.Context, key string) (value ByteView, ok bool) {
 	// 更新命中计数
 	atomic.AddInt64(&c.hits, 1)
 
-	// 转换并返回
+	// 转换并返回，val是Value接口，所以需要类型断言
 	if bv, ok := val.(ByteView); ok {
 		return bv, true
 	}
@@ -144,7 +147,7 @@ func (c *Cache) AddWithExpiration(key string, value ByteView, expirationTime tim
 	c.ensureInitialized()
 
 	// 计算过期时间
-	expiration := time.Until(expirationTime)
+	expiration := time.Until(expirationTime) // 现在距离过期还有多久
 	if expiration <= 0 {
 		logrus.Debugf("Key %s already expired, not adding to cache", key)
 		return
@@ -180,7 +183,7 @@ func (c *Cache) Clear() {
 	c.store.Clear()
 
 	// 重置统计信息
-	atomic.StoreInt64(&c.hits, 0)
+	atomic.StoreInt64(&c.hits, 0) // 原子写
 	atomic.StoreInt64(&c.misses, 0)
 }
 
@@ -198,7 +201,8 @@ func (c *Cache) Len() int {
 
 // Close 关闭缓存，释放资源
 func (c *Cache) Close() {
-	// 如果已经关闭，直接返回
+	// 如果没关就关闭。如果已经关闭，直接退出。
+	// api的意思是如果前值是0就改成1，否则失败
 	if !atomic.CompareAndSwapInt32(&c.closed, 0, 1) {
 		return
 	}
@@ -208,10 +212,11 @@ func (c *Cache) Close() {
 
 	// 关闭底层存储
 	if c.store != nil {
+		//这里是判断store这个对象是否实现了Close接口
 		if closer, ok := c.store.(interface{ Close() }); ok {
 			closer.Close()
 		}
-		c.store = nil
+		c.store = nil // 接触引用
 	}
 
 	// 重置缓存状态

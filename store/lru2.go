@@ -121,7 +121,7 @@ func (s *lru2Store) Get(key string) (Value, bool) {
 
 		// 项目有效，将其移至二级缓存，put是向缓存中添加项
 		s.caches[idx][1].put(key, n1.v, expireAt, s.onEvicted)
-		fmt.Println("项目有效，将其移至二级缓存")
+		// fmt.Println("项目有效，将其移至二级缓存")
 		return n1.v, true
 	}
 
@@ -392,7 +392,7 @@ func (c *cache) adjust(idx, f, t uint16) {
 	}
 }
 
-// level=1代表L2缓存
+// level=1代表L2缓存，=0代表L1缓存
 func (s *lru2Store) _get(key string, idx, level int32) (*node, int) {
 	//n,st代表节点和状态，st>0表示命中缓存，n！=nil表示存在
 	if n, st := s.caches[idx][level].get(key); st > 0 && n != nil {

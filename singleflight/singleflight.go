@@ -48,10 +48,11 @@ func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, err
 		defer func() {
 			if r := recover(); r != nil {
 				//把panic转换为error
-				if err,ok := r.(error);ok{//类型断言
+				if err, ok := r.(error); ok { //类型断言
 					c.err = err
-			}else{
-				c.err = fmt.Errorf("%v",r)
+				} else {
+					c.err = fmt.Errorf("%v", r)
+				}
 			}
 		}()
 		c.val, c.err = fn()
