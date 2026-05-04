@@ -6,7 +6,7 @@ type ByteView struct {
 	b []byte // 小写，让字段不能被外部读取，防止修改
 }
 
-func (b ByteView) Len() int {
+func (b ByteView) Len() int { // 返回缓存数据的长度
 	return len(b.b)
 }
 
