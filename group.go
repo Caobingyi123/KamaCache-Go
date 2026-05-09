@@ -12,6 +12,11 @@ import (
 	"github.com/youngyangyang04/KamaCache-Go/singleflight"
 )
 
+// 在前面的cache层里有一个问题，就是如过缓存没命中，返回一个ByteView{},false
+// 但是实际上我们希望如果没查到缓存就去查其他节点，如果哈没有，就去查数据库，文件或者外部接口，
+// 然后把结果写进缓存，这就是这个group干的事情
+
+// 这个map会保存所有创建过的groups（得加读写锁）
 var (
 	groupsMu sync.RWMutex
 	groups   = make(map[string]*Group)
@@ -27,11 +32,12 @@ var ErrValueRequired = errors.New("value is required")
 var ErrGroupClosed = errors.New("cache group is closed")
 
 // Getter 加载键值的回调函数接口
+// 当缓存没有命中的时候，Group通过Getter取真实的源头加载数据
 type Getter interface {
 	Get(ctx context.Context, key string) ([]byte, error)
 }
 
-// GetterFunc 函数类型实现 Getter 接口
+// GetterFunc 函数类型实现 Getter 接口。允许把一个普通函数当成Getter来使用，因为实现了Getter接口
 type GetterFunc func(ctx context.Context, key string) ([]byte, error)
 
 // Get 实现 Getter 接口
@@ -39,19 +45,20 @@ func (f GetterFunc) Get(ctx context.Context, key string) ([]byte, error) {
 	return f(ctx, key)
 }
 
-// Group 是一个缓存命名空间
+// Group 是一个缓存命名空间，这个是比前面的cache更高级的一层。
 type Group struct {
 	name       string
-	getter     Getter
-	mainCache  *Cache
-	peers      PeerPicker
+	getter     Getter     // 本地缓存和peer都没有，就调用他去回源加载
+	mainCache  *Cache     // 本地缓存就是前面的cache层，g.mainCache.Get(ctx, key)，这样调用
+	peers      PeerPicker // 分布式节点选择
 	loader     *singleflight.Group
 	expiration time.Duration // 缓存过期时间，0表示永不过期
-	closed     int32         // 原子变量，标记组是否已关闭
+	closed     int32         // 原子变量-用atomic来读写，标记组是否已关闭
 	stats      groupStats    // 统计信息
 }
 
 // groupStats 保存组的统计信息
+// 方便后面调用atomic.AddInt64来处理
 type groupStats struct {
 	loads        int64 // 加载次数
 	localHits    int64 // 本地缓存命中次数
@@ -63,10 +70,21 @@ type groupStats struct {
 	loadDuration int64 // 加载总耗时（纳秒）
 }
 
-// GroupOption 定义Group的配置选项
+// GroupOption 定义Group的配置选项，可以修改Group默认配置
 type GroupOption func(*Group)
 
-// WithExpiration 设置缓存过期时间
+// func NewGroup(name string, cacheBytes int64, getter Getter, opts ...GroupOption) *Group
+// 可以看到只有name，cacheBytes和getter是必须填的，其他都是选填，下面就是在补充
+// WithExpiration 设置缓存过期时间，修改Group里面的时间
+// 把结构变成，通过下面几个函数单独添加
+// NewGroup(
+//     "users",
+//     1024,
+//     getter,
+//     WithExpiration(time.Minute),
+//     WithPeers(peers),
+// )
+
 func WithExpiration(d time.Duration) GroupOption {
 	return func(g *Group) {
 		g.expiration = d
@@ -87,7 +105,7 @@ func WithCacheOptions(opts CacheOptions) GroupOption {
 	}
 }
 
-// NewGroup 创建一个新的 Group 实例
+// NewGroup 创建一个新的 Group 实例，返回一个Group
 func NewGroup(name string, cacheBytes int64, getter Getter, opts ...GroupOption) *Group {
 	if getter == nil {
 		panic("nil Getter")
@@ -95,7 +113,7 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...GroupOption)
 
 	// 创建默认缓存选项
 	cacheOpts := DefaultCacheOptions()
-	cacheOpts.MaxBytes = cacheBytes
+	cacheOpts.MaxBytes = cacheBytes // 传进来的cacheBytes比默认的更高，用传进来的
 
 	g := &Group{
 		name:      name,
@@ -110,9 +128,11 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...GroupOption)
 	}
 
 	// 注册到全局组映射
+	// 先加锁
 	groupsMu.Lock()
 	defer groupsMu.Unlock()
 
+	// groups是前面定义的全局映射map，用来存储所有的组
 	if _, exists := groups[name]; exists {
 		logrus.Warnf("Group with name %s already exists, will be replaced", name)
 	}
@@ -137,6 +157,7 @@ func (g *Group) Get(ctx context.Context, key string) (ByteView, error) {
 		return ByteView{}, ErrGroupClosed
 	}
 
+	// 检车是否为空
 	if key == "" {
 		return ByteView{}, ErrKeyRequired
 	}
@@ -144,10 +165,11 @@ func (g *Group) Get(ctx context.Context, key string) (ByteView, error) {
 	// 从本地缓存获取
 	view, ok := g.mainCache.Get(ctx, key)
 	if ok {
+		// 命中+1
 		atomic.AddInt64(&g.stats.localHits, 1)
 		return view, nil
 	}
-
+	// 未命中+1
 	atomic.AddInt64(&g.stats.localMisses, 1)
 
 	// 尝试从其他节点获取或加载
@@ -155,6 +177,7 @@ func (g *Group) Get(ctx context.Context, key string) (ByteView, error) {
 }
 
 // Set 设置缓存值
+// 从这里开始设计分布式缓存同步之类的，不只是在本地了
 func (g *Group) Set(ctx context.Context, key string, value []byte) error {
 	// 检查组是否已关闭
 	if atomic.LoadInt32(&g.closed) == 1 {
@@ -169,6 +192,7 @@ func (g *Group) Set(ctx context.Context, key string, value []byte) error {
 	}
 
 	// 检查是否是从其他节点同步过来的请求
+	// 如果是其他的节点，那ctx里面会有from_peer = true
 	isPeerRequest := ctx.Value("from_peer") != nil
 
 	// 创建缓存视图
@@ -178,11 +202,13 @@ func (g *Group) Set(ctx context.Context, key string, value []byte) error {
 	if g.expiration > 0 {
 		g.mainCache.AddWithExpiration(key, view, time.Now().Add(g.expiration))
 	} else {
+		//如果没有过期时间，就普通写入
 		g.mainCache.Add(key, view)
 	}
 
 	// 如果不是从其他节点同步过来的请求，且启用了分布式模式，同步到其他节点
 	if !isPeerRequest && g.peers != nil {
+		// 开一个goroutine在后台异步写入
 		go g.syncToPeers(ctx, "set", key, value)
 	}
 
@@ -200,7 +226,8 @@ func (g *Group) Delete(ctx context.Context, key string) error {
 		return ErrKeyRequired
 	}
 
-	// 从本地缓存删除
+	// 从本地缓存删除，本来应该有返回值bool，但这里不用
+	// 因为不管成不成功都要检查后面的是否是其他节点过来的
 	g.mainCache.Delete(key)
 
 	// 检查是否是从其他节点同步过来的请求
@@ -216,17 +243,19 @@ func (g *Group) Delete(ctx context.Context, key string) error {
 
 // syncToPeers 同步操作到其他节点
 func (g *Group) syncToPeers(ctx context.Context, op string, key string, value []byte) {
+	// 如果没有开启peers，就是说明没有开启分布式模式，那么就直接返回
 	if g.peers == nil {
 		return
 	}
 
-	// 选择对等节点
+	// 根据key选择对应的远程节点
 	peer, ok, isSelf := g.peers.PickPeer(key)
+	// 如果失败了或者选到的是自己
 	if !ok || isSelf {
 		return
 	}
 
-	// 创建同步请求上下文
+	// 创建新的同步请求上下文
 	syncCtx := context.WithValue(context.Background(), "from_peer", true)
 
 	var err error
@@ -256,6 +285,9 @@ func (g *Group) Clear() {
 // Close 关闭组并释放资源
 func (g *Group) Close() error {
 	// 如果已经关闭，直接返回
+	// 不是0，直接返回false。
+	// 若为0，原子设为1并继续
+	// 只有第一goroutine能成功通过第一层，抢到权限
 	if !atomic.CompareAndSwapInt32(&g.closed, 0, 1) {
 		return nil
 	}
@@ -266,6 +298,7 @@ func (g *Group) Close() error {
 	}
 
 	// 从全局组映射中移除
+	// groups里面的key是name，value是Group
 	groupsMu.Lock()
 	delete(groups, g.name)
 	groupsMu.Unlock()
@@ -274,17 +307,18 @@ func (g *Group) Close() error {
 	return nil
 }
 
-// load 加载数据
+// load 加载数据，用在本地miss之后的加载环节
 func (g *Group) load(ctx context.Context, key string) (value ByteView, err error) {
 	// 使用 singleflight 确保并发请求只加载一次
 	startTime := time.Now()
 	viewi, err := g.loader.Do(key, func() (interface{}, error) {
-		return g.loadData(ctx, key)
+		return g.loadData(ctx, key) //真正加载数据的地方
 	})
 
 	// 记录加载时间
 	loadDuration := time.Since(startTime).Nanoseconds()
 	atomic.AddInt64(&g.stats.loadDuration, loadDuration)
+	// 加载次数+1
 	atomic.AddInt64(&g.stats.loads, 1)
 
 	if err != nil {
@@ -292,6 +326,7 @@ func (g *Group) load(ctx context.Context, key string) (value ByteView, err error
 		return ByteView{}, err
 	}
 
+	// 从interface里面断言
 	view := viewi.(ByteView)
 
 	// 设置到本地缓存
@@ -312,6 +347,7 @@ func (g *Group) loadData(ctx context.Context, key string) (value ByteView, err e
 		if ok && !isSelf {
 			value, err := g.getFromPeer(ctx, peer, key)
 			if err == nil {
+				// 远程命中+1，就不走getter了
 				atomic.AddInt64(&g.stats.peerHits, 1)
 				return value, nil
 			}
@@ -324,6 +360,7 @@ func (g *Group) loadData(ctx context.Context, key string) (value ByteView, err e
 	// 从数据源加载
 	bytes, err := g.getter.Get(ctx, key)
 	if err != nil {
+		// %w专门用来打印错误的原因
 		return ByteView{}, fmt.Errorf("failed to get data: %w", err)
 	}
 
@@ -364,7 +401,7 @@ func (g *Group) Stats() map[string]interface{} {
 		"loader_errors": atomic.LoadInt64(&g.stats.loaderErrors),
 	}
 
-	// 计算各种命中率
+	// 计算各种命中率，因为value是接口类型，所以要断言
 	totalGets := stats["local_hits"].(int64) + stats["local_misses"].(int64)
 	if totalGets > 0 {
 		stats["hit_rate"] = float64(stats["local_hits"].(int64)) / float64(totalGets)
@@ -379,6 +416,7 @@ func (g *Group) Stats() map[string]interface{} {
 	if g.mainCache != nil {
 		cacheStats := g.mainCache.Stats()
 		for k, v := range cacheStats {
+			// group和cache的区分开
 			stats["cache_"+k] = v
 		}
 	}
@@ -400,28 +438,45 @@ func ListGroups() []string {
 }
 
 // DestroyGroup 销毁指定名称的缓存组
+// 修改一下防止死锁，因为Close内部也有锁，如果defer解锁的话，会死锁，要先解锁
 func DestroyGroup(name string) bool {
 	groupsMu.Lock()
-	defer groupsMu.Unlock()
 
-	if g, exists := groups[name]; exists {
-		g.Close()
+	g, exists := groups[name]
+	if exists {
 		delete(groups, name)
-		logrus.Infof("[KamaCache] destroyed cache group [%s]", name)
-		return true
 	}
+	groupsMu.Unlock()
 
-	return false
+	if !exists {
+		return false
+	}
+	g.Close()
+	logrus.Infof("[KamaCache] destroyed cache group [%s]", name)
+	return true
 }
 
 // DestroyAllGroups 销毁所有缓存组
+// 清空groups和Group
+// 先把旧 groups 里的 Group 指针保存下来
+// 然后清空 groups
+// 释放锁
+// 最后一个个 Close，防止死锁
 func DestroyAllGroups() {
 	groupsMu.Lock()
-	defer groupsMu.Unlock()
-
+	// 先拿出所有的group
+	groupToClose := make(map[string]*Group, len(groups))
 	for name, g := range groups {
-		g.Close()
-		delete(groups, name)
-		logrus.Infof("[KamaCache] destroyed cache group [%s]", name)
+		groupToClose[name] = g
 	}
+
+	//清空全局groups表
+	groups = make(map[string]*Group)
+	groupsMu.Unlock()
+
+	for name, g := range groupToClose {
+		g.Close()
+		logrus.Infof("[kAMACACHE] destroyed cache group [%s]", name)
+	}
+
 }

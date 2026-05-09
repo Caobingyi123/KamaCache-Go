@@ -110,6 +110,7 @@ func (c *Cache) Get(ctx context.Context, key string) (value ByteView, ok bool) {
 	// 如果缓存未初始化，直接返回未命中
 	if atomic.LoadInt32(&c.initialized) == 0 {
 		atomic.AddInt64(&c.misses, 1) // 更新未命中计数，原子操作
+		//没命中就返回空结构体
 		return ByteView{}, false
 	}
 
@@ -212,7 +213,7 @@ func (c *Cache) Close() {
 
 	// 关闭底层存储
 	if c.store != nil {
-		//这里是判断store这个对象是否实现了Close接口
+		//这里是判断store这个对象是否是 ”有一个有Close方法的接口“，就是问store有没有Close方法
 		if closer, ok := c.store.(interface{ Close() }); ok {
 			closer.Close()
 		}

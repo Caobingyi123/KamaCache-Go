@@ -27,7 +27,7 @@ type Group struct {
 func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
 	// g.m.Load 从map中加载key对应的value
 	if existing, ok := g.m.Load(key); ok {
-		c := existing.(*call) //类型断言
+		c := existing.(*call) // 类型断言
 		c.wg.Wait()           // Wait for the existing request to finish
 		return c.val, c.err   // 如果有缓存，直接返回
 	}
