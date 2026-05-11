@@ -20,27 +20,30 @@ type call struct {
 
 // Group manages all kinds of calls
 type Group struct {
+	// m里存的是key -> *call
 	m sync.Map // 使用sync.Map来优化并发性能,减少锁的使用，多用于多读少写。
 }
 
 // Do 针对相同的key，保证多次调用Do()，都只会调用一次fn
 func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
-	// g.m.Load 从map中加载key对应的value
-	if existing, ok := g.m.Load(key); ok {
-		c := existing.(*call) // 类型断言
-		c.wg.Wait()           // Wait for the existing request to finish
-		return c.val, c.err   // 如果有缓存，直接返回
-	}
 
-	// If no ongoing request, create a new one
 	c := &call{}
 	c.wg.Add(1)
-	g.m.Store(key, c) // 把key存入sync。map
+
+	// LoadOrStore 原子操作
+	// 如果 key 已经存在，返回已有的 call，loaded=true
+	// 如果 key 不存在，把当前 c 存进去，loaded=false
+	actual, loaded := g.m.LoadOrStore(key, c)
+	if loaded {
+		existing := actual.(*call)
+		existing.wg.Wait()
+		return existing.val, existing.err
+	}
 
 	//用defer保证程序就算挂掉也能Done和Delete
 	defer func() {
 		c.wg.Done()     //唤醒所有的请求
-		g.m.Delete(key) //清理缓存，防止内存泄露
+		g.m.Delete(key) //清理缓存，防止内存泄露，本次的key已经处理完了所以删掉
 	}()
 
 	//用recover捕获panic
