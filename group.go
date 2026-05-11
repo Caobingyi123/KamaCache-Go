@@ -474,6 +474,7 @@ func DestroyAllGroups() {
 	groups = make(map[string]*Group)
 	groupsMu.Unlock()
 
+	// 这里的groupToClose是局部变量了，其他goroutine访问不到所以不用加锁
 	for name, g := range groupToClose {
 		g.Close()
 		logrus.Infof("[kAMACACHE] destroyed cache group [%s]", name)
