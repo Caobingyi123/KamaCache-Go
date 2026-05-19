@@ -1,5 +1,6 @@
 package kamacache
 
+//server.go 负责启动一个缓存节点的 gRPC 服务端，并把远程请求转发给本地 Group。
 import (
 	"context"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 
 // Server 定义缓存服务器
 type Server struct {
+	// 要实现grpc必须嵌入这个
 	pb.UnimplementedKamaCacheServer
 	addr       string           // 服务地址
 	svcName    string           // 服务名称
@@ -29,6 +31,7 @@ type Server struct {
 	etcdCli    *clientv3.Client // etcd客户端
 	stopCh     chan error       // 停止信号
 	opts       *ServerOptions   // 服务器选项
+	stopOnce   sync.Once
 }
 
 // ServerOptions 服务器配置选项
@@ -131,31 +134,34 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to listen: %v", err)
 	}
 
-	// 注册到etcd
-	stopCh := make(chan error)
 	go func() {
-		if err := registry.Register(s.svcName, s.addr, stopCh); err != nil {
+		// 先注册
+		if err := registry.Register(s.svcName, s.addr, s.stopCh); err != nil {
 			logrus.Errorf("failed to register service: %v", err)
-			close(stopCh)
 			return
 		}
 	}()
 
 	logrus.Infof("Server starting at %s", s.addr)
+	// 启动gRPC服务器
 	return s.grpcServer.Serve(lis)
 }
 
 // Stop 停止服务器
 func (s *Server) Stop() {
-	close(s.stopCh)
-	s.grpcServer.GracefulStop()
-	if s.etcdCli != nil {
-		s.etcdCli.Close()
-	}
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+		s.grpcServer.GracefulStop()
+		if s.etcdCli != nil {
+			s.etcdCli.Close()
+		}
+	})
+
 }
 
 // Get 实现Cache服务的Get方法
 func (s *Server) Get(ctx context.Context, req *pb.Request) (*pb.ResponseForGet, error) {
+	// 先根据group名，找到本地的缓存组
 	group := GetGroup(req.Group)
 	if group == nil {
 		return nil, fmt.Errorf("group %s not found", req.Group)
@@ -165,7 +171,7 @@ func (s *Server) Get(ctx context.Context, req *pb.Request) (*pb.ResponseForGet, 
 	if err != nil {
 		return nil, err
 	}
-
+	//包装成 gRPC 响应返回。
 	return &pb.ResponseForGet{Value: view.ByteSLice()}, nil
 }
 

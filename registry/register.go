@@ -1,5 +1,7 @@
 package registry
 
+// 把当前缓存节点注册到 etcd，并通过租约 KeepAlive 维持在线状态。
+// etcd负责发现有哪些缓存节点，grpc负责节点之间真等的GET,SET,DELETE请求
 import (
 	"context"
 	"fmt"
@@ -32,6 +34,7 @@ func Register(svcName, addr string, stopCh <-chan error) error {
 		return fmt.Errorf("failed to create etcd client: %v", err)
 	}
 
+	// 拿到本机ip，然后和端口号拼接
 	localIP, err := getLocalIP()
 	if err != nil {
 		cli.Close()
@@ -41,7 +44,7 @@ func Register(svcName, addr string, stopCh <-chan error) error {
 		addr = fmt.Sprintf("%s%s", localIP, addr)
 	}
 
-	// 创建租约
+	// 创建租约，这里是10s，如果不续租就自动删除。
 	lease, err := cli.Grant(context.Background(), 10) // 增加租约时间到10秒
 	if err != nil {
 		cli.Close()
@@ -50,6 +53,7 @@ func Register(svcName, addr string, stopCh <-chan error) error {
 
 	// 注册服务，使用完整的key路径
 	key := fmt.Sprintf("/services/%s/%s", svcName, addr)
+	//这里表示吧key绑定到刚才的租约上
 	_, err = cli.Put(context.Background(), key, addr, clientv3.WithLease(lease.ID))
 	if err != nil {
 		cli.Close()
@@ -71,6 +75,7 @@ func Register(svcName, addr string, stopCh <-chan error) error {
 			case <-stopCh:
 				// 服务注销，撤销租约
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				// revoke：主动取消租约
 				cli.Revoke(ctx, lease.ID)
 				cancel()
 				return
@@ -88,13 +93,16 @@ func Register(svcName, addr string, stopCh <-chan error) error {
 	return nil
 }
 
+// 获取本机IP 的方法
 func getLocalIP() (string, error) {
+	// InterfaceAddrs 获取所有的网络接口
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		return "", err
 	}
 
 	for _, addr := range addrs {
+		// 判断是否是localhost或者127.0.0.1，然后是不是IPv4
 		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
 			if ipNet.IP.To4() != nil {
 				return ipNet.IP.String(), nil

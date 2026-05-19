@@ -18,9 +18,11 @@ type Config struct {
 
 // DefaultConfig 默认配置
 var DefaultConfig = &Config{
-	DefaultReplicas:      50,
-	MinReplicas:          10,
-	MaxReplicas:          200,
-	HashFunc:             crc32.ChecksumIEEE,
+	DefaultReplicas: 50, // 虚拟节点
+	MinReplicas:     10,
+	MaxReplicas:     200,
+	HashFunc:        crc32.ChecksumIEEE, // 哈希算法的函数
+
+	//负载均衡阈值---表示负载差距超过 25% 时，后面的 checkAndRebalance 可能会调整虚拟节点数。
 	LoadBalanceThreshold: 0.25, // 25% 的负载不均衡度触发调整
 }

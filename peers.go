@@ -1,5 +1,6 @@
 package kamacache
 
+// 负责路由，即如果key不在本地，应该去哪里找
 import (
 	"context"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
+// 默认服务名称
 const defaultSvcName = "kama-cache"
 
 // PeerPicker 定义了peer选择器的接口
@@ -25,6 +27,7 @@ type PeerPicker interface {
 // Peer 定义了缓存节点的接口
 type Peer interface {
 	Get(group string, key string) ([]byte, error)
+	// 给远程节点设置缓存
 	Set(ctx context.Context, group string, key string, value []byte) error
 	Delete(group string, key string) (bool, error)
 	Close() error
@@ -32,11 +35,11 @@ type Peer interface {
 
 // ClientPicker 实现了PeerPicker接口
 type ClientPicker struct {
-	selfAddr string
-	svcName  string
+	selfAddr string // 当前节点地址
+	svcName  string // 服务名称
 	mu       sync.RWMutex
-	consHash *consistenthash.Map
-	clients  map[string]*Client
+	consHash *consistenthash.Map // 一致性哈希，存的是节点的地址
+	clients  map[string]*Client  // 地址到gRPC Client的映射
 	etcdCli  *clientv3.Client
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -78,13 +81,13 @@ func NewClientPicker(addr string, opts ...PickerOption) (*ClientPicker, error) {
 	for _, opt := range opts {
 		opt(picker)
 	}
-
+	// 创建etcd客户端
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   registry.DefaultConfig.Endpoints,
 		DialTimeout: registry.DefaultConfig.DialTimeout,
 	})
 	if err != nil {
-		cancel()
+		cancel() // 释放资源
 		return nil, fmt.Errorf("failed to create etcd client: %v", err)
 	}
 	picker.etcdCli = cli
@@ -101,27 +104,29 @@ func NewClientPicker(addr string, opts ...PickerOption) (*ClientPicker, error) {
 
 // startServiceDiscovery 启动服务发现
 func (p *ClientPicker) startServiceDiscovery() error {
-	// 先进行全量更新
+	// 先进行全量更新(先拉去所有存在的节点)
 	if err := p.fetchAllServices(); err != nil {
 		return err
 	}
 
-	// 启动增量更新
+	// 然后监听后续的新增和删除的节点x
 	go p.watchServiceChanges()
 	return nil
 }
 
 // watchServiceChanges 监听服务实例变化
 func (p *ClientPicker) watchServiceChanges() {
+	//创建一个etcd的watcher
 	watcher := clientv3.NewWatcher(p.etcdCli)
+	// 监听前缀为"/services/"+p.svcName的key，只要有修改就会往这个chan里面发信息
 	watchChan := watcher.Watch(p.ctx, "/services/"+p.svcName, clientv3.WithPrefix())
 
 	for {
 		select {
-		case <-p.ctx.Done():
+		case <-p.ctx.Done(): // 如果外面调用了p.canel()
 			watcher.Close()
 			return
-		case resp := <-watchChan:
+		case resp := <-watchChan: //如果etch有事件，那么就会往这个chan里面发信息
 			p.handleWatchEvents(resp.Events)
 		}
 	}
@@ -133,7 +138,7 @@ func (p *ClientPicker) handleWatchEvents(events []*clientv3.Event) {
 	defer p.mu.Unlock()
 
 	for _, event := range events {
-		addr := string(event.Kv.Value)
+		addr := string(event.Kv.Value) // 取地址
 		if addr == p.selfAddr {
 			continue
 		}
@@ -146,8 +151,8 @@ func (p *ClientPicker) handleWatchEvents(events []*clientv3.Event) {
 			}
 		case clientv3.EventTypeDelete:
 			if client, exists := p.clients[addr]; exists {
-				client.Close()
-				p.remove(addr)
+				client.Close() //关闭client
+				p.remove(addr) // 从一致性哈希中移除
 				logrus.Infof("Service removed at %s", addr)
 			}
 		}
@@ -156,20 +161,22 @@ func (p *ClientPicker) handleWatchEvents(events []*clientv3.Event) {
 
 // fetchAllServices 获取所有服务实例
 func (p *ClientPicker) fetchAllServices() error {
+	// 先创建一个3秒超时的context
 	ctx, cancel := context.WithTimeout(p.ctx, 3*time.Second)
 	defer cancel()
-
+	//从etcd查询所有的服务节点
+	// WithPrefix的意思是查询所有以"/services/"+p.svcName,开头的key
 	resp, err := p.etcdCli.Get(ctx, "/services/"+p.svcName, clientv3.WithPrefix())
 	if err != nil {
 		return fmt.Errorf("failed to get all services: %v", err)
 	}
-
+	// 加写锁
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	for _, kv := range resp.Kvs {
-		addr := string(kv.Value)
-		if addr != "" && addr != p.selfAddr {
+		addr := string(kv.Value)              // 拿到服务地址
+		if addr != "" && addr != p.selfAddr { // 不为空且不是自己
 			p.set(addr)
 			logrus.Infof("Discovered service at %s", addr)
 		}
@@ -190,11 +197,11 @@ func (p *ClientPicker) set(addr string) {
 
 // remove 移除服务实例
 func (p *ClientPicker) remove(addr string) {
-	p.consHash.Remove(addr)
-	delete(p.clients, addr)
+	p.consHash.Remove(addr) // 从一致性哈希里删除
+	delete(p.clients, addr) // 从map中删除链接
 }
 
-// PickPeer 选择peer节点
+// PickPeer 根据key选择远程的peer节点
 func (p *ClientPicker) PickPeer(key string) (Peer, bool, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -209,10 +216,11 @@ func (p *ClientPicker) PickPeer(key string) (Peer, bool, bool) {
 
 // Close 关闭所有资源
 func (p *ClientPicker) Close() error {
-	p.cancel()
+	p.cancel() //取消p.ctx，调用取消的信号，触发p.ctx.Done
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// 错误切片，多个错误
 	var errs []error
 	for addr, client := range p.clients {
 		if err := client.Close(); err != nil {
@@ -231,10 +239,11 @@ func (p *ClientPicker) Close() error {
 }
 
 // parseAddrFromKey 从etcd key中解析地址
+// 路径大概services/kama-cache/127.0.0.1:8001 要拿到最后的127....
 func parseAddrFromKey(key, svcName string) string {
 	prefix := fmt.Sprintf("/services/%s/", svcName)
-	if strings.HasPrefix(key, prefix) {
-		return strings.TrimPrefix(key, prefix)
+	if strings.HasPrefix(key, prefix) { // 判断key是否已prefix开头
+		return strings.TrimPrefix(key, prefix) // 去掉前缀
 	}
 	return ""
 }

@@ -14,6 +14,7 @@ func main() {
 	// 添加命令行参数，用于区分不同节点
 	port := flag.Int("port", 8001, "节点端口")
 	nodeID := flag.String("node", "A", "节点标识符")
+	// 解析命令行参数
 	flag.Parse()
 
 	addr := fmt.Sprintf(":%d", *port)
